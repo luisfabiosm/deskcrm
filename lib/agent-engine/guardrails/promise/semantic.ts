@@ -133,3 +133,55 @@ export function renderSemanticPromiseVeto(suspectPhrase: string | null): string 
     'não autorizada antes de reenviar.'
   );
 }
+
+/**
+ * Normaliza um texto para comparação LITERAL de condições autorizadas (#1954): caixa
+ * baixa e acentos removidos. Não é stemmer nem regex livre — só iguala o que difere por
+ * caixa/acento, que é o humano declarando a oferta oficial ("Teste de 7 dias" vs
+ * "teste de 7 dias"). O acento importa: "12 dias" ≠ "1,2 dias" (formas distintas ficam
+ * longe); só a mesma base com caixa/acento diferente casa.
+ */
+export function normalizarCondicaoAutorizada(texto: string): string {
+  return texto
+    .normalize('NFD')
+    .replace(/[\u0300-\u036f]/g, '')
+    .toLocaleLowerCase('pt-BR');
+}
+
+/**
+ * MASCARA as condições comerciais AUTORIZADAS da org no corpo DA CANDIDATA que vai ao
+ * classificador semântico de promessa (#1954) — NÃO é uma exceção no gate.
+ *
+ * Por quê mascarar em vez de vetar/passar: esta guarda existe para a IA não prometer o
+ * que a empresa não autorizou. Se o gate adotasse "passa se a frase destacada reproduz a
+ * oferta", uma mensagem que junta a oferta AUTORIZADA + uma promessa NOVA sairia junto
+ * (o classificador destaca só o trecho autorizado e a promessa extra passa de carona).
+ * Mascarando a oferta ANTES da classificação, o modelo julga só o resto: se houver
+ * promessa além da oferta, ela fica visível e o gate veta; se a mensagem for SÓ a oferta,
+ * o resto não é promessa e passa. O gate contínua com exceção ZERO.
+ *
+ * Regras de máscara (sem regex livre, espelhando a tabela versionada):
+ *  - cada condição é normalizada (caixa/acento) e comparada como iguaLdade literal por
+ *    substring da base — não stemmer, não termo parcial esparso;
+ *  - a ocorrência da condição no corpo é substituída por ESPAÇOS do mesmo comprimento
+ *    (preserva o resto da frase intacto — sem acento, alinhamento re-fito pela caixa
+ *    baixa, mas irrelevante p/ decidir se o RESTO promete);
+ *  - sem lista ou sem ocorrência → corpo inalterado (comportamento atual).
+ */
+export function mascararCondicoesAutorizadas(
+  candidate: string,
+  condicoesAutorizadas: readonly string[] | undefined,
+): string {
+  if (!condicoesAutorizadas || condicoesAutorizadas.length === 0) return candidate;
+  const base = normalizarCondicaoAutorizada(candidate);
+  let restante = base;
+  for (const condicao of condicoesAutorizadas) {
+    const normalizada = normalizarCondicaoAutorizada(condicao);
+    if (normalizada === '') continue;
+    // Remove TODAS as ocorrências da condição (o classificador julga só o que sobra).
+    while (restante.includes(normalizada)) {
+      restante = restante.replace(normalizada, ' '.repeat(normalizada.length));
+    }
+  }
+  return restante;
+}
