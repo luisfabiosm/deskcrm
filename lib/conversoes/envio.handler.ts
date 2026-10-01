@@ -52,8 +52,10 @@ import type {
 } from "@/lib/plataformas-de-anuncio/types";
 import { createAdminClient } from "@/lib/supabase/admin";
 import { lerAtribuicao } from "./leitura-da-atribuicao";
+import { lerValorDaConversa } from "./valor-da-conversa";
 import { lerVendaPeloCanal } from "./venda-pelo-canal";
 import { ehEventoDeEtapa } from "./regras-google";
+import { ehEventoDeEtapaMeta } from "./regras-meta";
 import { lerRegistro, registraEnvio } from "./registro-de-envio";
 
 const CONSUMER_KEY = "conversoes.venda";
@@ -67,15 +69,27 @@ const ok = (status: HandlerResult["status"], detail?: string): HandlerResult => 
   detail,
 });
 
+/**
+ * O evento de ETAPA que acompanha o envio, quando não é a compra. Do Google
+ * vem a ação de conversão (`googleActionId`); da Meta, o nome padrão do evento
+ * (`eventoMeta`, 0506). Um dos dois — é ele que diz a plataforma da regra.
+ */
+export interface EventoDeEtapa {
+  ocorridoEm: string;
+  evento?: NomeDoEvento;
+  googleActionId?: string;
+  eventoMeta?: string;
+}
+
 export async function processarConversao(
   row: EventRow,
-  qualificacao?: { ocorridoEm: string; googleActionId: string; evento?: NomeDoEvento },
+  qualificacao?: EventoDeEtapa,
 ): Promise<HandlerResult> {
   const EVENTO: NomeDoEvento = qualificacao ? (qualificacao.evento ?? "QualifiedLead") : "Purchase";
   if (
     !qualificacao &&
     row.event_type === "ad_conversion.retry_requested" &&
-    ehEventoDeEtapa(row.payload.event_name)
+    (ehEventoDeEtapa(row.payload.event_name) || ehEventoDeEtapaMeta(row.payload.event_name))
   )
     return ok("skipped", "outro_evento");
   if (!row.entity_id) return ok("skipped", "sem_entidade");
@@ -135,12 +149,21 @@ export async function processarConversao(
     "identificadoresGoogle" in leitura.atribuicao
       ? leitura.atribuicao.identificadoresGoogle
       : undefined;
-  if (qualificacao && plataforma !== "google_ads")
+  // A regra de etapa é de UMA plataforma: o lead que veio da outra não é dela.
+  // Sai sem linha no livro-razão — não há pendência, havia nada a reportar.
+  if (qualificacao && !qualificacao.eventoMeta && plataforma !== "google_ads")
     return ok("skipped", "qualificacao_sem_origem_google");
+  if (qualificacao?.eventoMeta && plataforma !== "meta_ads")
+    return ok("skipped", "etapa_sem_origem_meta");
 
   /** O valor que a compra leva — `null` quando sai sem valor (0436). */
   let valorDaVenda: number | null =
     lead.value_cents !== null && lead.value_cents > 0 ? lead.value_cents : null;
+  let moedaDaVenda: string | null = lead.currency;
+  /** O que foi vendido, quando a conversa disse — vai no evento da Meta. */
+  let produto: string | null = null;
+  /** De onde veio o valor (ou por que faltou), quando ele foi lido da conversa. */
+  let detalheDoValor: string | null = null;
 
   const registra = (
     status: "sent" | "skipped" | "error",
@@ -166,10 +189,11 @@ export async function processarConversao(
         ? {
             ocorridoEm: registro?.event_occurred_at ?? qualificacao.ocorridoEm,
             googleActionId: registro?.google_action_id ?? qualificacao.googleActionId,
+            metaEventName: registro?.meta_event_name ?? qualificacao.eventoMeta,
           }
         : {}),
-      moeda: registro?.remote_request_id ? registro.currency : lead.currency,
-      detalhe: detalhe ?? null,
+      moeda: registro?.remote_request_id ? registro.currency : moedaDaVenda,
+      detalhe: detalhe ?? detalheDoValor,
       protocolo,
       solicitadoEm,
     });
@@ -191,10 +215,33 @@ export async function processarConversao(
   // No Google a organização escolhe (0436, `google_purchase_value_mode`): a
   // compra pode sair SEM valor — nunca com zero —, e o Google a conta como uma
   // conversão sem receita. Por isso a decisão do Google espera a credencial.
-  const semValor =
+  //
+  // Na Meta, antes de desistir, a conversa: quem opera pediu a venda sem passo
+  // humano, então o valor DITO na conversa vale como valor da venda. Só o dito —
+  // `valor-da-conversa.ts` recusa o que não consegue mostrar escrito, e aí a
+  // pendência `sem_valor` segue, agora com o motivo no Histórico.
+  if (
     !qualificacao &&
     !registro?.remote_request_id &&
-    (lead.value_cents === null || lead.value_cents <= 0);
+    valorDaVenda === null &&
+    plataforma === "meta_ads"
+  ) {
+    const lido = await lerValorDaConversa(
+      admin,
+      row.organization_id,
+      lead.contact_id,
+      lead.currency ?? "BRL",
+    );
+    if (lido.ok) {
+      valorDaVenda = lido.valorCentavos;
+      moedaDaVenda = lido.moeda;
+      produto = lido.produto;
+      detalheDoValor = `Valor lido da conversa: "${lido.trecho}"`;
+    } else {
+      detalheDoValor = lido.motivo;
+    }
+  }
+  const semValor = !qualificacao && !registro?.remote_request_id && valorDaVenda === null;
   if (semValor && plataforma !== "google_ads") {
     await registra("skipped", "sem_valor");
     return ok("skipped", "sem_valor");
@@ -230,7 +277,7 @@ export async function processarConversao(
       plataforma === "meta_ads" &&
       EVENTO === "Purchase" &&
       !registro?.remote_request_id &&
-      lead.value_cents !== null
+      valorDaVenda !== null
     ) {
       // A chave vem ANTES de tudo (doc 76): desligada — o padrão —, nem as
       // conversas são lidas, e nada sai para o provedor.
@@ -254,8 +301,8 @@ export async function processarConversao(
           eventId: `${lead.id}:${EVENTO}`,
           occurredAt: new Date(lead.closed_at ?? row.created_at ?? Date.now()),
           phone: telefone,
-          valueCents: lead.value_cents,
-          currency: lead.currency ?? "BRL",
+          valueCents: valorDaVenda,
+          currency: moedaDaVenda ?? "BRL",
         });
         return desfecho(doCanal(pelo), false);
       }
@@ -272,19 +319,28 @@ export async function processarConversao(
   }
   if (!qualificacao && modoDeValor === "nunca") valorDaVenda = null;
 
-  if (qualificacao && credencial.credencial.google) {
-    credencial.credencial.google.conversionActionId =
-      registro?.google_action_id ?? qualificacao.googleActionId;
+  const acaoDoGoogle = registro?.google_action_id ?? qualificacao?.googleActionId;
+  if (qualificacao && acaoDoGoogle && credencial.credencial.google) {
+    credencial.credencial.google.conversionActionId = acaoDoGoogle;
   }
   if (qualificacao && !registro?.event_occurred_at) {
     await registra("skipped", "nova_tentativa_agendada");
     // O primeiro snapshot vence também quando dois movimentos concorrem.
     const salvo = await lerRegistro(admin, row.organization_id, lead.id, EVENTO);
-    if (!salvo?.event_occurred_at || !salvo.google_action_id)
-      throw new Error("Snapshot da qualificação ausente.");
-    qualificacao = { ocorridoEm: salvo.event_occurred_at, googleActionId: salvo.google_action_id };
-    if (credencial.credencial.google)
-      credencial.credencial.google.conversionActionId = salvo.google_action_id;
+    if (qualificacao.eventoMeta) {
+      if (!salvo?.event_occurred_at || !salvo.meta_event_name)
+        throw new Error("Snapshot do evento de etapa ausente.");
+      qualificacao = { ocorridoEm: salvo.event_occurred_at, eventoMeta: salvo.meta_event_name };
+    } else {
+      if (!salvo?.event_occurred_at || !salvo.google_action_id)
+        throw new Error("Snapshot da qualificação ausente.");
+      qualificacao = {
+        ocorridoEm: salvo.event_occurred_at,
+        googleActionId: salvo.google_action_id,
+      };
+      if (credencial.credencial.google)
+        credencial.credencial.google.conversionActionId = salvo.google_action_id;
+    }
   }
 
   const conversao: ConversaoOffline = {
@@ -306,8 +362,14 @@ export async function processarConversao(
     telefone,
     // A coluna tem `DEFAULT 'BRL'` e um CHECK de ISO-4217; o fallback só cobre a
     // linha que teve a moeda apagada à mão.
-    moeda: lead.currency ?? "BRL",
+    moeda: moedaDaVenda ?? "BRL",
     valorCentavos: qualificacao ? null : valorDaVenda,
+    produto,
+    // O nome no fio do evento de etapa da Meta: o retrato, e só na falta dele a
+    // regra — mudar a regra depois não rebatiza uma conversão já registrada.
+    eventoNaPlataforma: qualificacao?.eventoMeta
+      ? (registro?.meta_event_name ?? qualificacao.eventoMeta)
+      : null,
   };
 
   // Protocolo já recebido: consultar é a única operação permitida até concluir.
