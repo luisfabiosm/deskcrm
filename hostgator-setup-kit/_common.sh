@@ -7,6 +7,7 @@ set -euo pipefail
 # por install.sh; instalação já em andamento no mesmo processo (install.sh)
 # mantém a escolha, já exportada em DESKCOMM_IDIOMA_CLI.
 source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/_i18n.sh"
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/_manifestos.sh"
 
 COMPOSE="docker-compose.prod.yml"
 COMPOSE_TRAEFIK="docker-compose.traefik.yml"
@@ -1379,11 +1380,48 @@ ghcr_status() {
 # tests/unit/listas-de-imagens-seguem-matriz.test.ts. Renomear a função
 # quebraria o leitor daquele teste sem ganhar nada: o que importa é a lista.
 trio_publicado() {
-  local tag="$1" i
-  for i in deskcommcrm deskcomm-worker deskcomm-scheduler deskcomm-voice-agent; do
-    [ "$(ghcr_status "$i" "$tag")" = "200" ] || return 1
-  done
-  return 0
+  local tag="$1" plataforma
+  plataforma="$(plataforma_oci_do_host "$(uname -m 2>/dev/null || true)")" || return 1
+  preflight_imagens_crm "$tag" "$plataforma"
+}
+
+# Instalação nova usa uma única versão numérica nas quatro imagens próprias e
+# confere a imagem WAHA efetiva, inclusive quando foi escolhida pelo operador.
+# Só consulta registry; não escreve .env, banco, Docker ou configuração.
+preflight_instalacao() { # <X.Y.Z> <linux/platform> <WAHA_IMAGE efetiva>
+  local versao="${1:-}" plataforma="${2:-}" waha="${3:-}"
+  if ! [[ "$versao" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+    printf 'A instalação ARM64 exige versão numérica publicada (X.Y.Z): %s\n' "$versao" >&2
+    return 1
+  fi
+  [ -n "$waha" ] || { printf 'WAHA_IMAGE vazia\n' >&2; return 1; }
+  preflight_imagens_crm "$versao" "$plataforma" || return 1
+  if ! manifesto_tem_plataforma "$waha" "$plataforma"; then
+    printf 'WAHA_IMAGE %s não oferece %s; escolha uma imagem compatível, sem perder sessões/volumes.\n' "$waha" "$plataforma" >&2
+    return 1
+  fi
+}
+
+# Confere uma atualização real sem mudar o .env. No ARM64 legado, apenas os
+# defaults AMD64 conhecidos serão migrados por gravar_imagens DEPOIS do backup;
+# a sonda usa o destino futuro para não rejeitar falsamente a instalação.
+# WAHA customizada/Plus nunca é substituída nem na sonda nem no update.
+preflight_atualizacao() { # <vX.Y.Z> <linux/platform>; usa WAHA_IMAGE carregada
+  local tag="${1:-}" plataforma="${2:-}" versao waha
+  if ! [[ "$tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+    printf 'Atualização exige tag numérica publicada (vX.Y.Z): %s\n' "$tag" >&2
+    return 1
+  fi
+  versao="${tag#v}"
+  waha="${WAHA_IMAGE:-$(imagem_waha_padrao_para_host)}"
+  if [ "$plataforma" = linux/arm64 ] && waha_amd64_conhecido_em_arm arm64 "$waha"; then
+    waha='devlikeapro/waha:noweb-arm-2026.7.2'
+  fi
+  preflight_imagens_crm "$versao" "$plataforma" || return 1
+  if ! manifesto_tem_plataforma "$waha" "$plataforma"; then
+    printf 'WAHA_IMAGE %s não oferece %s; não alterei a escolha do operador.\n' "$waha" "$plataforma" >&2
+    return 1
+  fi
 }
 
 # O .env está com pin PELA METADE? (app fixado numa versão, worker/scheduler não)
